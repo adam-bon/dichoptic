@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dichoptic Fusion Trainer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #eee;
+               font-family: system-ui, sans-serif; display: flex; flex-direction: column;
+               align-items: center; justify-content: center; gap: 1rem; padding: 1rem; }
+  button { font-size: 1.4rem; padding: 1rem 2rem; border-radius: 8px;
+           border: none; cursor: pointer; }
+  #level { font-size: 1rem; opacity: 0.85; text-align: center; }
+  #status { font-size: 0.95rem; opacity: 0.9; text-align: center; max-width: 40ch;
+            color: #ffd27f; min-height: 2.5em; }
+  #msg { position: fixed; bottom: 1rem; left: 0; right: 0;
+         text-align: center; font-size: 0.9rem; opacity: 0.65; line-height: 1.5; }
+</style>
+</head>
+<body>
+<button id="enter">Enter VR</button>
+<div id="level"></div>
+<div id="status"></div>
+<div id="msg">
+  Left trigger &rarr; change colour pair (wraps around)<br>
+  Right trigger &rarr; flip which eye sees which colour
+</div>
+<script>
+let gl, xrSession, xrRefSpace;
+let swapped = false;   // false: pair.a = left eye, pair.b = right eye
+let pairIndex = 0;
+
+const PAIRS = [
+  { name: '1 - Pure red / green (opponent, hardest)',
+    a: [0.00, 1.00, 0.00],   // green
+    b: [1.00, 0.00, 0.00] }, // red
+  { name: '2 - Lime / orange (straddles yellow, fusible)',
+    a: [0.60, 1.00, 0.00],   // lime (greenish-yellow)
+    b: [1.00, 0.55, 0.00] }, // orange (reddish-yellow)
+];
+
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+
+function updateLabel() {
+  const p = PAIRS[pairIndex];
+  const aEye = swapped ? 'right eye' : 'left eye';
+  const bEye = swapped ? 'left eye'  : 'right eye';
+  document.getElementById('level').textContent =
+    `${p.name}  |  first colour = ${aEye}, second = ${bEye}`;
+}
+updateLabel();
+
+document.getElementById('enter').addEventListener('click', async () => {
+  setStatus('Requesting session...');
+  try {
+    if (!navigator.xr) { setStatus('navigator.xr is missing — this browser has no WebXR.'); return; }
+    const supported = await navigator.xr.isSessionSupported('immersive-vr');
+    if (!supported) { setStatus('immersive-vr reported as NOT supported here.'); return; }
+
+    xrSession = await navigator.xr.requestSession('immersive-vr');
+    setStatus(''); // success
+
+    xrSession.addEventListener('select', (e) => {
+      const hand = e.inputSource && e.inputSource.handedness;
+      if (hand === 'left')  { pairIndex = (pairIndex + 1) % PAIRS.length; updateLabel(); }
+      if (hand === 'right') { swapped = !swapped; updateLabel(); }
+    });
+    xrSession.addEventListener('end', () => { xrSession = null; });
+
+    const canvas = document.createElement('canvas');
+    gl = canvas.getContext('webgl2', { xrCompatible: true })
+      || canvas.getContext('webgl', { xrCompatible: true });
+
+    await xrSession.updateRenderState({ baseLayer: new XRWebGLLayer(xrSession, gl) });
+    xrRefSpace = await xrSession.requestReferenceSpace('local');
+    xrSession.requestAnimationFrame(onFrame);
+  } catch (err) {
+    // Surface the real reason instead of failing silently.
+    setStatus('Enter VR failed: ' + (err && err.name ? err.name : 'Error') +
+              ' — ' + (err && err.message ? err.message : String(err)) +
+              '. If this is a file:// page, host it over HTTPS or localhost.');
+  }
+});
+
+function onFrame(t, frame) {
+  const session = frame.session;
+  session.requestAnimationFrame(onFrame);
+
+  const pose = frame.getViewerPose(xrRefSpace);
+  if (!pose) return;
+
+  const layer = session.renderState.baseLayer;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+
+  const p = PAIRS[pairIndex];
+  const aIsLeft = !swapped;
+
+  for (const view of pose.views) {
+    const vp = layer.getViewport(view);
+    gl.viewport(vp.x, vp.y, vp.width, vp.height);
+    gl.enable(gl.SCISSOR_TEST);
+    gl.scissor(vp.x, vp.y, vp.width, vp.height);
+    const c = (view.eye === 'left') === aIsLeft ? p.a : p.b;
+    gl.clearColor(c[0], c[1], c[2], 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+  gl.disable(gl.SCISSOR_TEST);
+}
+</script>
+</body>
+</html>
