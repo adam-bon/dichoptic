@@ -3,108 +3,254 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Dichoptic Fusion Trainer</title>
+<title>Dichoptic Void + Disparity Anchor</title>
 <style>
   html, body { margin: 0; height: 100%; background: #111; color: #eee;
                font-family: system-ui, sans-serif; display: flex; flex-direction: column;
                align-items: center; justify-content: center; gap: 1rem; padding: 1rem; }
-  button { font-size: 1.4rem; padding: 1rem 2rem; border-radius: 8px;
-           border: none; cursor: pointer; }
-  #level { font-size: 1rem; opacity: 0.85; text-align: center; }
-  #status { font-size: 0.95rem; opacity: 0.9; text-align: center; max-width: 40ch;
-            color: #ffd27f; min-height: 2.5em; }
-  #msg { position: fixed; bottom: 1rem; left: 0; right: 0;
-         text-align: center; font-size: 0.9rem; opacity: 0.65; line-height: 1.5; }
+  button { font-size: 1.4rem; padding: 1rem 2rem; border-radius: 8px; border: none; cursor: pointer; }
+  #status { font-size: 0.95rem; opacity: 0.9; text-align: center; max-width: 46ch; color: #ffd27f; min-height: 2.5em; }
+  #msg { position: fixed; bottom: 0.6rem; left: 0; right: 0; text-align: center; font-size: 0.82rem; opacity: 0.62; line-height: 1.5; }
 </style>
 </head>
 <body>
 <button id="enter">Enter VR</button>
-<div id="level"></div>
 <div id="status"></div>
 <div id="msg">
-  Left trigger &rarr; change colour pair (wraps around)<br>
-  Right trigger &rarr; flip which eye sees which colour
+  Right stick: X = disparity (depth) &middot; Y = vertical align (cancel your deviation)<br>
+  Left stick: X = anchor size &middot; Y = contrast balance (dim dominant eye)<br>
+  Left trigger = colour level &middot; Right trigger = flip eyes<br>
+  Left grip = anchor on/off &middot; Right grip = reset disparity + align
 </div>
 <script>
 let gl, xrSession, xrRefSpace;
-let swapped = false;   // false: pair.a = left eye, pair.b = right eye
-let pairIndex = 0;
+let swapped = false, pairIndex = 4, anchorOn = true;
+let hdisp = 0.0, valign = 0.0, balance = 0.0, ringScale = 1.3;
+let lastT = 0, overlayUntil = 0, lastOverlayBuild = 0;
 
 const PAIRS = [
-  { name: '1 - Pure red / green (opponent, hardest)',
-    a: [0.00, 1.00, 0.00],   // green
-    b: [1.00, 0.00, 0.00] }, // red
-  { name: '2 - Lime / orange (straddles yellow, fusible)',
-    a: [0.60, 1.00, 0.00],   // lime (greenish-yellow)
-    b: [1.00, 0.55, 0.00] }, // orange (reddish-yellow)
+  { diff: 1, name: 'Lime / Orange',            a: [0.60,1.00,0.00], b: [1.00,0.550,0.00] },
+  { diff: 2, name: 'Yellow-green / Amber',     a: [0.45,1.00,0.00], b: [1.00,0.413,0.00] },
+  { diff: 3, name: 'Chartreuse / Dark orange', a: [0.30,1.00,0.00], b: [1.00,0.275,0.00] },
+  { diff: 4, name: 'Green / Red-orange',       a: [0.15,1.00,0.00], b: [1.00,0.138,0.00] },
+  { diff: 5, name: 'Pure green / Pure red',    a: [0.00,1.00,0.00], b: [1.00,0.000,0.00] },
 ];
 
-function setStatus(msg) { document.getElementById('status').textContent = msg; }
+const DZ = 0.15;
+const DISP_SPEED = 0.15, ALIGN_SPEED = 0.12, BAL_SPEED = 0.8, SIZE_SPEED = 0.9;
+const HDISP_MAX = 0.15, VALIGN_MAX = 0.12, SIZE_MIN = 0.4, SIZE_MAX = 1.8;
+const RING_ALPHA = 0.85;
 
-function updateLabel() {
+function setStatus(m){ document.getElementById('status').textContent = m; }
+function clamp(v,lo,hi){ return v<lo?lo:v>hi?hi:v; }
+function dz(v){ return Math.abs(v) < DZ ? 0 : v; }
+function sgn(v){ return (v>=0?'+':'') + v.toFixed(3); }
+
+function currentLines(){
   const p = PAIRS[pairIndex];
-  const aEye = swapped ? 'right eye' : 'left eye';
-  const bEye = swapped ? 'left eye'  : 'right eye';
-  document.getElementById('level').textContent =
-    `${p.name}  |  first colour = ${aEye}, second = ${bEye}`;
+  const bal = balance>0.05 ? ('dim green '+Math.round(balance*100)+'%')
+            : balance<-0.05 ? ('dim red '+Math.round(-balance*100)+'%') : 'even';
+  return [
+    'Anchor ' + (anchorOn?'ON':'OFF') + '    Colour ' + p.diff + '  ' + p.name,
+    'Disp ' + sgn(hdisp) + '   V-align ' + sgn(valign) + '   Bal ' + bal + '   Size ' + ringScale.toFixed(2),
+  ];
 }
-updateLabel();
 
+/* ---------- GL text + anchor via one textured-quad program ---------- */
+let prog, textVBO, anchorVBO, textTex, ringTex, textCanvas, aPosLoc, aUVLoc, uTexLoc, uOffLoc, uSclLoc, uAlpLoc;
+
+const VS = `attribute vec2 aPos; attribute vec2 aUV; varying vec2 vUV;
+  uniform vec2 uOff; uniform float uScl;
+  void main(){ vUV=aUV; gl_Position=vec4(aPos*uScl + uOff, 0.0, 1.0); }`;
+const FS = `precision mediump float; varying vec2 vUV; uniform sampler2D uTex; uniform float uAlp;
+  void main(){ vec4 t=texture2D(uTex,vUV); gl_FragColor=vec4(t.rgb, t.a*uAlp); }`;
+
+function compile(type,src){ const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+
+function quad(x0,y0,x1,y1){ return new Float32Array([
+  x0,y1, 0,0,   x0,y0, 0,1,   x1,y1, 1,0,   x1,y0, 1,1 ]); }
+
+function initGL(){
+  prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  aPosLoc = gl.getAttribLocation(prog,'aPos');
+  aUVLoc  = gl.getAttribLocation(prog,'aUV');
+  uTexLoc = gl.getUniformLocation(prog,'uTex');
+  uOffLoc = gl.getUniformLocation(prog,'uOff');
+  uSclLoc = gl.getUniformLocation(prog,'uScl');
+  uAlpLoc = gl.getUniformLocation(prog,'uAlp');
+
+  textVBO = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, textVBO);
+  gl.bufferData(gl.ARRAY_BUFFER, quad(-0.72,-0.45,0.72,-0.80), gl.STATIC_DRAW);
+
+  anchorVBO = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, anchorVBO);
+  gl.bufferData(gl.ARRAY_BUFFER, quad(-0.5,-0.5,0.5,0.5), gl.STATIC_DRAW);
+
+  textTex = gl.createTexture();
+  textCanvas = document.createElement('canvas');
+  textCanvas.width = 1280; textCanvas.height = 300;
+
+  ringTex = makeRingTexture();
+}
+
+function makeRingTexture(){
+  const c = document.createElement('canvas'); c.width = c.height = 1024;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0,0,1024,1024);
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 14;
+  const cx = 512, cy = 512;
+  [0.20,0.34,0.48,0.62,0.76].forEach(fr => {
+    ctx.beginPath(); ctx.arc(cx, cy, fr*512, 0, Math.PI*2); ctx.stroke();
+  });
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath(); ctx.arc(cx, cy, 10, 0, Math.PI*2); ctx.fill();
+
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return tex;
+}
+
+function buildTextTexture(lines){
+  const c = textCanvas, ctx = c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  ctx.fillStyle = 'rgba(18,18,18,0.92)';
+  ctx.fillRect(0,0,c.width,c.height);
+  const font = w => `bold ${w}px system-ui, -apple-system, sans-serif`;
+  let fs = 72; ctx.font = font(fs);
+  const widest = () => Math.max.apply(null, lines.map(t => ctx.measureText(t).width));
+  while (widest() > c.width - 80 && fs > 22) { fs -= 2; ctx.font = font(fs); }
+  ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const lh = c.height / lines.length;
+  lines.forEach((t,i) => ctx.fillText(t, c.width/2, lh*(i+0.5)));
+  gl.bindTexture(gl.TEXTURE_2D, textTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function flash(dur){ buildTextTexture(currentLines()); overlayUntil = performance.now() + dur; lastOverlayBuild = performance.now(); }
+
+function drawQuad(vbo, tex, scl, ox, oy, alpha){
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(prog);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.enableVertexAttribArray(aPosLoc); gl.vertexAttribPointer(aPosLoc,2,gl.FLOAT,false,16,0);
+  gl.enableVertexAttribArray(aUVLoc);  gl.vertexAttribPointer(aUVLoc,2,gl.FLOAT,false,16,8);
+  gl.uniform2f(uOffLoc, ox, oy); gl.uniform1f(uSclLoc, scl); gl.uniform1f(uAlpLoc, alpha);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(uTexLoc,0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.disable(gl.BLEND);
+}
+
+/* ---------- session ---------- */
 document.getElementById('enter').addEventListener('click', async () => {
   setStatus('Requesting session...');
   try {
-    if (!navigator.xr) { setStatus('navigator.xr is missing — this browser has no WebXR.'); return; }
-    const supported = await navigator.xr.isSessionSupported('immersive-vr');
-    if (!supported) { setStatus('immersive-vr reported as NOT supported here.'); return; }
-
+    if (!navigator.xr) { setStatus('navigator.xr missing — no WebXR here.'); return; }
+    if (!(await navigator.xr.isSessionSupported('immersive-vr'))) { setStatus('immersive-vr not supported here.'); return; }
     xrSession = await navigator.xr.requestSession('immersive-vr');
-    setStatus(''); // success
+    setStatus('');
 
     xrSession.addEventListener('select', (e) => {
-      const hand = e.inputSource && e.inputSource.handedness;
-      if (hand === 'left')  { pairIndex = (pairIndex + 1) % PAIRS.length; updateLabel(); }
-      if (hand === 'right') { swapped = !swapped; updateLabel(); }
+      const h = e.inputSource && e.inputSource.handedness;
+      if (h === 'left')  { pairIndex = (pairIndex+1) % PAIRS.length; flash(2200); }
+      if (h === 'right') { swapped = !swapped; flash(2200); }
+    });
+    xrSession.addEventListener('squeeze', (e) => {
+      const h = e.inputSource && e.inputSource.handedness;
+      if (h === 'left')  { anchorOn = !anchorOn; flash(2200); }
+      if (h === 'right') { hdisp = 0; valign = 0; flash(2200); }
     });
     xrSession.addEventListener('end', () => { xrSession = null; });
 
     const canvas = document.createElement('canvas');
-    gl = canvas.getContext('webgl2', { xrCompatible: true })
-      || canvas.getContext('webgl', { xrCompatible: true });
-
+    gl = canvas.getContext('webgl2', { xrCompatible:true }) || canvas.getContext('webgl', { xrCompatible:true });
+    initGL();
     await xrSession.updateRenderState({ baseLayer: new XRWebGLLayer(xrSession, gl) });
     xrRefSpace = await xrSession.requestReferenceSpace('local');
+    flash(2600);
     xrSession.requestAnimationFrame(onFrame);
   } catch (err) {
-    // Surface the real reason instead of failing silently.
-    setStatus('Enter VR failed: ' + (err && err.name ? err.name : 'Error') +
-              ' — ' + (err && err.message ? err.message : String(err)) +
-              '. If this is a file:// page, host it over HTTPS or localhost.');
+    setStatus('Enter VR failed: ' + (err && err.name ? err.name : 'Error') + ' — ' + (err && err.message ? err.message : String(err)) +
+              '. If this is a file:// page, host over HTTPS or localhost.');
   }
 });
 
-function onFrame(t, frame) {
+function pollSticks(session, dt){
+  let active = false;
+  for (const src of session.inputSources) {
+    const g = src.gamepad; if (!g || !g.axes) continue;
+    const ax = g.axes;
+    const sx = dz(ax.length > 2 ? ax[2] : (ax[0] || 0));
+    const sy = dz(ax.length > 3 ? ax[3] : (ax[1] || 0));
+    if (sx === 0 && sy === 0) continue;
+    active = true;
+    if (src.handedness === 'right') {
+      hdisp  = clamp(hdisp  + sx * DISP_SPEED  * dt, -HDISP_MAX, HDISP_MAX);
+      valign = clamp(valign - sy * ALIGN_SPEED * dt, -VALIGN_MAX, VALIGN_MAX);
+    } else if (src.handedness === 'left') {
+      ringScale = clamp(ringScale + sx * SIZE_SPEED * dt, SIZE_MIN, SIZE_MAX);
+      balance   = clamp(balance   - sy * BAL_SPEED  * dt, -1, 1);
+    }
+  }
+  return active;
+}
+
+function onFrame(t, frame){
   const session = frame.session;
   session.requestAnimationFrame(onFrame);
+  const dt = lastT ? Math.min((t - lastT)/1000, 0.05) : 0.016; lastT = t;
 
   const pose = frame.getViewerPose(xrRefSpace);
   if (!pose) return;
+
+  if (pollSticks(session, dt)) {
+    const now = performance.now();
+    if (now - lastOverlayBuild > 100) { buildTextTexture(currentLines()); lastOverlayBuild = now; }
+    overlayUntil = Math.max(overlayUntil, now + 800);
+  }
 
   const layer = session.renderState.baseLayer;
   gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
 
   const p = PAIRS[pairIndex];
   const aIsLeft = !swapped;
+  const gFactor = balance > 0 ? (1 - balance*0.6) : 1;   // dim green side
+  const rFactor = balance < 0 ? (1 + balance*0.6) : 1;   // dim red side
+  const showOverlay = performance.now() < overlayUntil;
 
   for (const view of pose.views) {
     const vp = layer.getViewport(view);
     gl.viewport(vp.x, vp.y, vp.width, vp.height);
-    gl.enable(gl.SCISSOR_TEST);
-    gl.scissor(vp.x, vp.y, vp.width, vp.height);
-    const c = (view.eye === 'left') === aIsLeft ? p.a : p.b;
-    gl.clearColor(c[0], c[1], c[2], 1);
+    gl.enable(gl.SCISSOR_TEST); gl.scissor(vp.x, vp.y, vp.width, vp.height);
+
+    const isGreen = (view.eye === 'left') === aIsLeft;
+    const c = isGreen ? p.a : p.b;
+    const f = isGreen ? gFactor : rFactor;
+    gl.clearColor(c[0]*f, c[1]*f, c[2]*f, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.disable(gl.SCISSOR_TEST);
+
+    if (anchorOn) {
+      const ox = (view.eye === 'left') ? hdisp*0.5 : -hdisp*0.5;
+      const oy = (view.eye === 'right') ? valign : 0;
+      drawQuad(anchorVBO, ringTex, ringScale, ox, oy, RING_ALPHA);
+    }
+    if (showOverlay) drawQuad(textVBO, textTex, 1, 0, 0, 1);
   }
-  gl.disable(gl.SCISSOR_TEST);
 }
 </script>
 </body>
